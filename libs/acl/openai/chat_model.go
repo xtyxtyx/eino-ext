@@ -197,6 +197,8 @@ func NewClient(ctx context.Context, config *Config) (*Client, error) {
 		clientConf.HTTPClient = http.DefaultClient
 	}
 
+	clientConf.EmptyMessagesLimit = 10240
+
 	return &Client{
 		cli:    openai.NewClientWithConfig(clientConf),
 		config: config,
