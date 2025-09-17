@@ -2,6 +2,8 @@ module github.com/cloudwego/eino-ext/libs/acl/openai
 
 go 1.23.0
 
+replace github.com/meguminnnnnnnnn/go-openai => /Users/mac/code/go-openai
+
 require (
 	github.com/bytedance/mockey v1.2.13
 	github.com/cloudwego/eino v0.3.27

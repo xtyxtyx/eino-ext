@@ -168,6 +168,9 @@ type Client struct {
 	tools      []tool
 	rawTools   []*schema.ToolInfo
 	toolChoice *schema.ToolChoice
+
+	// Usage callback configuration
+	usageCallbackConfig *UsageCallbackConfig
 }
 
 func NewClient(ctx context.Context, config *Config) (*Client, error) {
@@ -370,8 +373,23 @@ func (c *Client) genRequest(in []*schema.Message, opts ...model.Option) (*openai
 		ReasoningEffort:     string(specOptions.ReasoningEffort),
 	}
 
+	// Combine extra fields with usage parameter if needed
+	extraFields := make(map[string]any)
 	if len(specOptions.ExtraFields) > 0 {
-		req.SetExtraFields(specOptions.ExtraFields)
+		for k, v := range specOptions.ExtraFields {
+			extraFields[k] = v
+		}
+	}
+
+	// Add usage parameter if configured
+	if c.usageCallbackConfig != nil && c.usageCallbackConfig.IncludeUsageInRequest {
+		extraFields["usage"] = map[string]any{
+			"include": true,
+		}
+	}
+
+	if len(extraFields) > 0 {
+		req.SetExtraFields(extraFields)
 	}
 
 	cbInput := &model.CallbackInput{
@@ -546,6 +564,9 @@ func (c *Client) Generate(ctx context.Context, in []*schema.Message, opts ...mod
 		TotalTokens:      resp.Usage.TotalTokens,
 	}
 
+	// Trigger usage callback if configured
+	c.triggerUsageCallback(ctx, outMsg.ResponseMeta.Usage, &resp.Usage)
+
 	callbacks.OnEnd(ctx, &model.CallbackOutput{
 		Message:    outMsg,
 		Config:     cbInput.Config,
@@ -595,11 +616,17 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 		}()
 
 		var lastEmptyMsg *schema.Message
+		var lastEmptyMsgRawUsage interface{}
 
 		for {
 			chunk, chunkErr := stream.Recv()
 			if errors.Is(chunkErr, io.EOF) {
 				if lastEmptyMsg != nil {
+					// Trigger usage callback for final message with usage info
+					if lastEmptyMsg.ResponseMeta != nil && lastEmptyMsg.ResponseMeta.Usage != nil {
+						// Use the rawUsage that was captured with this message
+						c.triggerUsageCallback(ctx, lastEmptyMsg.ResponseMeta.Usage, lastEmptyMsgRawUsage)
+					}
 					sw.Send(&model.CallbackOutput{
 						Message:    lastEmptyMsg,
 						Config:     cbInput.Config,
@@ -617,7 +644,7 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 			// stream usage return in last chunk without message content, then
 			// last message received from callback output stream: Message == nil and TokenUsage != nil
 			// last message received from outStream: Message != nil
-			msg, found := resolveStreamResponse(chunk)
+			msg, found, rawUsage := resolveStreamResponse(chunk)
 			if !found {
 				continue
 			}
@@ -638,10 +665,17 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 
 			if msg.Content == "" && len(msg.ToolCalls) == 0 && !(ok && len(rc) > 0) {
 				lastEmptyMsg = msg
+				lastEmptyMsgRawUsage = rawUsage
 				continue
 			}
 
 			lastEmptyMsg = nil
+			lastEmptyMsgRawUsage = nil
+
+			// Trigger usage callback if this message has usage info
+			if msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
+				c.triggerUsageCallback(ctx, msg.ResponseMeta.Usage, rawUsage)
+			}
 
 			closed := sw.Send(&model.CallbackOutput{
 				Message:    msg,
@@ -760,7 +794,7 @@ func byteSlice2int64(in []byte) []int64 {
 	return ret
 }
 
-func resolveStreamResponse(resp openai.ChatCompletionStreamResponse) (msg *schema.Message, found bool) {
+func resolveStreamResponse(resp openai.ChatCompletionStreamResponse) (msg *schema.Message, found bool, rawUsage interface{}) {
 	for _, choice := range resp.Choices {
 		// take 0 index as response, rewrite if needed
 		if choice.Index != 0 {
@@ -793,9 +827,15 @@ func resolveStreamResponse(resp openai.ChatCompletionStreamResponse) (msg *schem
 			},
 		}
 		found = true
+		rawUsage = resp.Usage
 	}
 
-	return msg, found
+	// Return raw usage if available
+	if resp.Usage != nil {
+		rawUsage = resp.Usage
+	}
+
+	return msg, found, rawUsage
 }
 
 func toTools(tis []*schema.ToolInfo) ([]tool, error) {
@@ -935,6 +975,18 @@ func (c *Client) BindForcedTools(tools []*schema.ToolInfo) error {
 
 func (c *Client) IsCallbacksEnabled() bool {
 	return true
+}
+
+// WithUsageCallback configures usage callbacks for the client
+func (c *Client) WithUsageCallback(config *UsageCallbackConfig) *Client {
+	nc := *c
+	nc.usageCallbackConfig = config
+	return &nc
+}
+
+// SetUsageCallback sets the usage callback configuration for the client
+func (c *Client) SetUsageCallback(config *UsageCallbackConfig) {
+	c.usageCallbackConfig = config
 }
 
 type panicErr struct {
